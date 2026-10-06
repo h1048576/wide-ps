@@ -1,0 +1,14 @@
+{
+  "baseUrl": "http://localhost:20128/v1",
+  "apiKey": "sk-8a3316bd1cf5f6cf-7703e9-99ea6cb2",
+  "models": [
+    {
+      "model": "cbcn/glm-5.3-flashx",
+      "displayName": "glm-5.3-flashx"
+    },
+    {
+      "model": "cbcn/deepseek-v4.1-flash",
+      "displayName": "deepseek-v4.1-flash"
+    }
+  ]
+}

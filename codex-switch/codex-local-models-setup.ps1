@@ -1,11 +1,13 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-为 Codex 配置本地模型，默认使用 glm-5.3-flashx，思考等级为 xhigh。
+按 JSON 配置同步 Codex 本地模型，默认使用列表中第一个模型，思考等级为 xhigh，上下文为 1M。
 .EXAMPLE
 powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-local-models-setup.ps1
 .EXAMPLE
 .\codex-local-models-setup.ps1 -Model deepseek-v4.1-flash
+.EXAMPLE
+.\codex-local-models-setup.ps1 -ConfigFile .\codex-local-models.json
 .EXAMPLE
 .\codex-local-models-setup.ps1 -Action Menu
 .EXAMPLE
@@ -15,18 +17,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-local-models-setup.p
 配置：https://developers.openai.com/codex/config-reference/
 只写入 config.toml、models-local.json 和备份目录，不修改 auth.json。
 首次安装前的配置永久保留；每次修改另存一份快照；失败时回滚。
-支持 Windows PowerShell 5.1 / PowerShell 7，也支持读取脚本文本后执行 iex。
+模型配置默认读取脚本同目录的 codex-local-models.json。
+新增、修改、删除模型后重新执行脚本；列表至少保留一个模型。
+恢复时读取原始备份，不依赖 JSON 配置文件，也恢复原上下文及压缩设置。
+支持 Windows PowerShell 5.1 / PowerShell 7；使用 iex 时通过 -ConfigFile 指定配置文件。
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Install', 'Menu', 'Restore')]
     [string]$Action = 'Install',
 
-    [ValidateSet('glm-5.3-flashx', 'deepseek-v4.1-flash')]
-    [string]$Model = 'glm-5.3-flashx',
+    # 支持完整模型 ID、显示名称或模型 ID 的最后一段；省略时选择 JSON 中第一项。
+    [string]$Model = '',
 
-    [string]$BaseUrl = 'http://localhost:20128/v1',
-    [string]$ApiKey = 'sk-8a3316bd1cf5f6cf-7703e9-99ea6cb2',
+    [string]$ConfigFile = '',
+
+    # 省略时使用 JSON 中的共享连接配置。
+    [string]$BaseUrl = '',
+    [string]$ApiKey = '',
 
     [string]$CodexHomeDir = $(
         if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
@@ -42,14 +50,22 @@ param(
 
 # 子作用域避免 irm | iex 改变调用方的严格模式、错误处理或函数定义。
 & {
+    param($SetupParameters)
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version 2.0
 
     $providerId = 'local_models'
     $reasoningEffort = 'xhigh'
-    $modelSlugs = @('cbcn/glm-5.3-flashx', 'cbcn/deepseek-v4.1-flash')
+    $contextWindow = 1000000
+    $configuredModels = @()
+    $modelSlugs = @()
+    # PowerShell 5.1 的参数默认值求值时，PSScriptRoot 可能尚未初始化。
+    if ([string]::IsNullOrWhiteSpace($ConfigFile)) {
+        $settingsDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { [string]$PWD }
+        $ConfigFile = Join-Path $settingsDirectory 'codex-local-models.json'
+    }
     $selectedAction = $Action
-    $selectedModel = $Model
+    $selectedEntry = $null
     $configDirectory = [IO.Path]::GetFullPath($CodexHomeDir)
     $configPath = Join-Path $configDirectory 'config.toml'
     $catalogPath = Join-Path $configDirectory 'models-local.json'
@@ -61,6 +77,71 @@ param(
     function Write-Status {
         param([string]$Message)
         Write-Host ('[OK] ' + $Message) -ForegroundColor Green
+    }
+
+    function Get-SafeMessage {
+        param([string]$Message)
+        if ($ApiKey) { return $Message.Replace($ApiKey, '[已隐藏密钥]') }
+        return $Message
+    }
+
+    function Read-ModelSettings {
+        param([string]$Path)
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw ('模型配置文件不存在：' + $Path + "`n请将 codex-local-models.json 放在脚本旁边，或使用 -ConfigFile 指定路径。")
+        }
+        try {
+            $settings = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            throw ('模型配置不是有效 JSON，请检查文件：' + $Path)
+        }
+        if ($null -eq $settings -or $settings -is [Array] -or $settings -is [string]) {
+            throw 'JSON 配置的最外层必须是对象，包含 models 数组。'
+        }
+        $modelsProperty = $settings.PSObject.Properties['models']
+        if ($null -eq $modelsProperty -or $modelsProperty.Value -isnot [Array] -or $modelsProperty.Value.Count -eq 0) {
+            throw 'JSON 中的 models 必须是非空数组，请至少保留一个模型。'
+        }
+        $entries = @()
+        $uniqueIds = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        for ($i = 0; $i -lt $modelsProperty.Value.Count; $i++) {
+            $entry = $modelsProperty.Value[$i]
+            if ($null -eq $entry) { throw ('models[' + $i + '] 不能为空。') }
+            foreach ($field in @('model', 'displayName')) {
+                $property = $entry.PSObject.Properties[$field]
+                if ($null -eq $property -or $property.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($property.Value)) {
+                    throw ('models[' + $i + '].' + $field + ' 必须是非空字符串。')
+                }
+                if ($property.Value -match '[\x00-\x1f\x7f]') { throw ('models[' + $i + '].' + $field + ' 不能包含控制字符。') }
+            }
+            $id = $entry.model.Trim()
+            if (-not $uniqueIds.Add($id)) { throw ('配置中存在重复模型 ID：' + $id) }
+            $entries += [pscustomobject]@{ model = $id; displayName = $entry.displayName.Trim() }
+        }
+        $sharedBaseUrl = ''
+        $sharedApiKey = ''
+        foreach ($field in @('baseUrl', 'apiKey')) {
+            $property = $settings.PSObject.Properties[$field]
+            if ($null -ne $property) {
+                if ($property.Value -isnot [string]) { throw ($field + ' 必须是字符串。') }
+                if ($field -eq 'baseUrl') { $sharedBaseUrl = $property.Value }
+                else { $sharedApiKey = $property.Value }
+            }
+        }
+        return [pscustomobject]@{ models = $entries; baseUrl = $sharedBaseUrl; apiKey = $sharedApiKey }
+    }
+
+    function Select-ConfiguredModel {
+        param([string]$Requested)
+        if ([string]::IsNullOrWhiteSpace($Requested)) { return $configuredModels[0] }
+        $matchesById = @($configuredModels | Where-Object { $_.model -ceq $Requested })
+        if ($matchesById.Count -eq 1) { return $matchesById[0] }
+        $matchesByName = @($configuredModels | Where-Object { $_.displayName -ceq $Requested })
+        if ($matchesByName.Count -eq 1) { return $matchesByName[0] }
+        if ($matchesByName.Count -gt 1) { throw '显示名称对应多个模型，请使用 -Model 指定完整模型 ID。' }
+        $matchesByShortId = @($configuredModels | Where-Object { $_.model.Substring($_.model.LastIndexOf('/') + 1) -ceq $Requested })
+        if ($matchesByShortId.Count -eq 1) { return $matchesByShortId[0] }
+        throw ('无法唯一匹配模型：' + $Requested + '。请使用 JSON 中的完整模型 ID。')
     }
 
     function ConvertTo-TomlString {
@@ -131,6 +212,7 @@ param(
             model_provider = (ConvertTo-TomlString $providerId)
             model_catalog_json = (ConvertTo-TomlString ($catalogPath.Replace('\', '/')))
             model_reasoning_effort = (ConvertTo-TomlString $reasoningEffort)
+            model_context_window = [string]$contextWindow
             web_search = '"disabled"'
         }
         # 清理上一模型专属的覆盖值，避免发送网关未声明支持的参数。
@@ -138,7 +220,7 @@ param(
             'profile', 'preferred_auth_method', 'forced_login_method', 'openai_base_url',
             'plan_mode_reasoning_effort',
             'model_reasoning_summary', 'model_supports_reasoning_summaries', 'model_verbosity', 'service_tier',
-            'model_context_window', 'model_auto_compact_token_limit',
+            'model_auto_compact_token_limit',
             'model_auto_compact_token_limit_scope'
         )
         $output = New-Object 'Collections.Generic.List[string]'
@@ -195,11 +277,11 @@ param(
     function New-CatalogText {
         $instructions = '你是 Codex 编程助手。遵守用户和工作目录中的指令，先检查现有代码，再完成用户要求的修改。使用可用工具处理文件和命令；尽量保留无关配置和用户已有修改。根据证据说明结果，不声称执行过尚未执行的操作。默认使用中文回复。'
         $entries = @()
-        for ($i = 0; $i -lt $modelSlugs.Count; $i++) {
+        for ($i = 0; $i -lt $configuredModels.Count; $i++) {
             $entries += [ordered]@{
-                slug = $modelSlugs[$i]
-                display_name = $modelSlugs[$i].Substring(5)
-                description = '通过 localhost:20128 的 Responses API 使用本地网关模型'
+                slug = $configuredModels[$i].model
+                display_name = $configuredModels[$i].displayName
+                description = '通过本地模型网关使用 Responses API'
                 visibility = 'list'
                 supported_in_api = $true
                 priority = $i + 1
@@ -223,9 +305,9 @@ param(
                 default_service_tier = $null
                 input_modalities = @('text', 'image')
                 supports_image_detail_original = $false
-                # 两个模型的 /v1/models 均声明 context_length = 1000000。
-                context_window = 1000000
-                max_context_window = 1000000
+                # 与 config.toml 的上下文设置一致：1M = 1,000,000 tokens。
+                context_window = $contextWindow
+                max_context_window = $contextWindow
                 effective_context_window_percent = 95
                 truncation_policy = @{ mode = 'tokens'; limit = 10000 }
                 availability_nux = $null
@@ -262,7 +344,7 @@ param(
             if (-not $completed) { throw '未收到 response.completed 流式事件。' }
             Write-Status ('模型列表和 ' + $Slug + ' 的 Responses 流式接口可用')
         } catch {
-            $message = $_.Exception.Message.Replace($ApiKey, '[已隐藏密钥]')
+            $message = Get-SafeMessage $_.Exception.Message
             throw ('连接检查失败：' + $message + "`n原配置未修改。确认本地服务已启动并支持 /v1/responses；仅准备配置时可使用 -SkipConnectionCheck。")
         }
     }
@@ -321,19 +403,37 @@ param(
         }
     }
 
+    if ($selectedAction -ne 'Restore') {
+        $modelSettings = Read-ModelSettings $ConfigFile
+        $configuredModels = @($modelSettings.models)
+        $modelSlugs = @($configuredModels | ForEach-Object { $_.model })
+        if (-not $SetupParameters.ContainsKey('BaseUrl')) { $BaseUrl = $modelSettings.baseUrl }
+        if (-not $SetupParameters.ContainsKey('ApiKey')) { $ApiKey = $modelSettings.apiKey }
+    }
+
     if ($selectedAction -eq 'Menu') {
         Write-Host ''
-        Write-Host '1. 使用 glm-5.3-flashx（默认）'
-        Write-Host '2. 使用 deepseek-v4.1-flash'
-        Write-Host '9. 恢复首次安装前的配置'
+        for ($i = 0; $i -lt $configuredModels.Count; $i++) {
+            $suffix = if ($i -eq 0) { '（默认）' } else { '' }
+            # 编号 9 固定用于恢复；第九个及之后的模型从 10 开始编号。
+            $menuNumber = if ($i -lt 8) { $i + 1 } else { $i + 2 }
+            Write-Host ('{0}. 使用 {1} [{2}]{3}' -f $menuNumber, $configuredModels[$i].displayName, $configuredModels[$i].model, $suffix)
+        }
+        Write-Host '9. 恢复首次安装前的配置（包括上下文）'
         Write-Host '0. 退出'
-        $choice = (Read-Host '请选择，直接回车使用 GLM').Trim()
-        switch ($choice) {
-            { $_ -in @('', '1') } { $selectedModel = 'glm-5.3-flashx'; $selectedAction = 'Install' }
-            '2' { $selectedModel = 'deepseek-v4.1-flash'; $selectedAction = 'Install' }
-            '9' { $selectedAction = 'Restore' }
-            '0' { return }
-            default { throw '无效的菜单选项。' }
+        $choice = (Read-Host '请选择，直接回车使用列表中第一个模型').Trim()
+        if ($choice -eq '0') { return }
+        if ($choice -eq '9') { $selectedAction = 'Restore' }
+        else {
+            if ($choice -eq '') { $choice = '1' }
+            $number = 0
+            if (-not [int]::TryParse($choice, [ref]$number)) { throw '无效的菜单选项。' }
+            $modelIndex = if ($number -lt 9) { $number - 1 } else { $number - 2 }
+            if ($number -eq 9 -or $modelIndex -lt 0 -or $modelIndex -ge $configuredModels.Count) {
+                throw '无效的菜单选项。'
+            }
+            $selectedEntry = $configuredModels[$modelIndex]
+            $selectedAction = 'Install'
         }
     }
 
@@ -344,7 +444,9 @@ param(
     $newConfig = ''
     $newCatalog = ''
     if ($selectedAction -eq 'Install') {
+        if ($null -eq $selectedEntry) { $selectedEntry = Select-ConfiguredModel $Model }
         if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw 'ApiKey 不能为空。' }
+        if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'BaseUrl 不能为空，请在 JSON 中填写 baseUrl。' }
         $endpoint = $BaseUrl.Trim().TrimEnd('/')
         $endpointUri = $null
         if (-not [Uri]::TryCreate($endpoint, [UriKind]::Absolute, [ref]$endpointUri) -or
@@ -352,13 +454,13 @@ param(
             $endpointUri.AbsolutePath -cne '/v1' -or $endpointUri.Query -or $endpointUri.Fragment -or $endpointUri.UserInfo) {
             throw 'BaseUrl 必须是本机地址，且以 /v1 结尾，例如 http://localhost:20128/v1。'
         }
-        $slug = 'cbcn/' + $selectedModel
+        $slug = $selectedEntry.model
         if (-not $SkipConnectionCheck) { Confirm-LocalEndpoint $endpoint $slug }
         $original = if (Test-Path -LiteralPath $configPath -PathType Leaf) { [IO.File]::ReadAllText($configPath) } else { '' }
         $newConfig = New-ConfigText $original $slug $endpoint
         $newCatalog = New-CatalogText
         $catalog = ConvertFrom-Json -InputObject $newCatalog
-        if (@($catalog.models).Count -ne 2) { throw '生成的模型目录无效。' }
+        if (@($catalog.models).Count -ne $configuredModels.Count) { throw '生成的模型目录无效。' }
     }
 
     New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
@@ -369,12 +471,13 @@ param(
     try {
         if ($selectedAction -eq 'Restore') {
             Restore-Snapshot $initialBackup
-            Write-Status '已恢复首次安装前的配置'
+            Write-Status '已恢复首次安装前的配置，包括原上下文及压缩设置'
         } else {
             Set-AtomicFile $catalogPath $newCatalog
             Set-AtomicFile $configPath $newConfig
-            Write-Status ('已登记两个模型，默认使用 ' + $selectedModel)
+            Write-Status ('已按 JSON 同步 ' + $configuredModels.Count + ' 个模型，默认使用 ' + $selectedEntry.displayName + ' [' + $selectedEntry.model + ']')
             Write-Status ('模型思考等级：' + $reasoningEffort)
+            Write-Status ('上下文：1M [' + $contextWindow + ' tokens]')
             Write-Status ('配置文件：' + $configPath)
             Write-Status ('模型目录：' + $catalogPath)
         }
@@ -382,21 +485,18 @@ param(
         $failure = $_
         try { Restore-Snapshot $snapshotPath }
         catch {
-            $rollbackMessage = $_.Exception.Message
-            $failureMessage = $failure.Exception.Message
-            if ($ApiKey) {
-                $rollbackMessage = $rollbackMessage.Replace($ApiKey, '[已隐藏密钥]')
-                $failureMessage = $failureMessage.Replace($ApiKey, '[已隐藏密钥]')
-            }
+            $rollbackMessage = Get-SafeMessage $_.Exception.Message
+            $failureMessage = Get-SafeMessage $failure.Exception.Message
             throw ("修改失败：$failureMessage`n自动回滚失败：$rollbackMessage`n请从此备份手动恢复：$snapshotPath")
         }
-        throw ('修改失败，已回滚到本次操作前：' + $failure.Exception.Message.Replace($ApiKey, '[已隐藏密钥]'))
+        throw ('修改失败，已回滚到本次操作前：' + (Get-SafeMessage $failure.Exception.Message))
     }
     Write-Status ('本次操作前的备份：' + $snapshotPath)
     Write-Host '请完全退出并重新打开 Codex 桌面端 / IDE 插件，CLI 请重新启动。'
     Write-Host '新建对话使用默认模型；已有对话可能保留原模型。'
     if ($selectedAction -eq 'Install') {
-        Write-Host 'CLI 临时切换：codex -m cbcn/deepseek-v4.1-flash'
+        Write-Host ('模型来源：' + [IO.Path]::GetFullPath($ConfigFile))
+        Write-Host ('CLI 指定模型：codex -m "' + $selectedEntry.model + '"')
         if ($SkipConnectionCheck) { Write-Warning '已跳过连接检查；实际使用时需要启动本地服务。' }
     }
-}
+} $PSBoundParameters
