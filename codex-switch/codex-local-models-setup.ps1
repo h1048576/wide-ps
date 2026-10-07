@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-按 JSON 配置同步 Codex 本地模型，默认使用列表中第一个模型，思考等级为 xhigh，上下文为 1M。
+按 JSON 配置同步 Codex 本地模型，默认使用列表中第一个模型，思考等级取该模型 effect 数组最后一项，上下文为 1M。
 .EXAMPLE
 powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-local-models-setup.ps1
 .EXAMPLE
@@ -19,6 +19,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-local-models-setup.p
 首次安装前的配置永久保留；每次修改另存一份快照；失败时回滚。
 模型配置默认读取脚本同目录的 codex-local-models.json。
 新增、修改、删除模型后重新执行脚本；列表至少保留一个模型。
+每个模型可填写 effect 字符串数组，例如 ["high", "xhigh", "max"]，默认使用最后一项；省略时使用 ["xhigh"]。
+同步各模型的可选思考等级，并将所有模型的档位合并到 [desktop] 的 enabled-reasoning-efforts。
 恢复时读取原始备份，不依赖 JSON 配置文件，也恢复原上下文及压缩设置。
 支持 Windows PowerShell 5.1 / PowerShell 7；使用 iex 时通过 -ConfigFile 指定配置文件。
 #>
@@ -55,7 +57,18 @@ param(
     Set-StrictMode -Version 2.0
 
     $providerId = 'local_models'
-    $reasoningEffort = 'xhigh'
+    $defaultReasoningEffort = 'xhigh'
+    $reasoningEffort = ''
+    $reasoningDescriptions = @{
+        none = '不启用思考'
+        minimal = '最低思考等级'
+        low = '低思考等级'
+        medium = '中等思考等级'
+        high = '高思考等级'
+        xhigh = '超高思考等级'
+        ultra = '极高思考等级'
+        max = '最高思考等级'
+    }
     $contextWindow = 1000000
     $configuredModels = @()
     $modelSlugs = @()
@@ -116,7 +129,22 @@ param(
             }
             $id = $entry.model.Trim()
             if (-not $uniqueIds.Add($id)) { throw ('配置中存在重复模型 ID：' + $id) }
-            $entries += [pscustomobject]@{ model = $id; displayName = $entry.displayName.Trim() }
+            $effects = @($defaultReasoningEffort)
+            $effectProperty = $entry.PSObject.Properties['effect']
+            if ($null -ne $effectProperty) {
+                if ($effectProperty.Value -isnot [Array] -or $effectProperty.Value.Count -eq 0) {
+                    throw ('models[' + $i + '].effect 必须是非空字符串数组，例如 ["high", "xhigh", "max"]。')
+                }
+                $effects = @()
+                foreach ($effect in $effectProperty.Value) {
+                    if ($effect -isnot [string] -or @($reasoningDescriptions.Keys) -cnotcontains $effect) {
+                        throw ('models[' + $i + '].effect 仅支持 none、minimal、low、medium、high、xhigh、ultra、max。')
+                    }
+                    if ($effects -ccontains $effect) { throw ('models[' + $i + '].effect 存在重复档位：' + $effect) }
+                    $effects += $effect
+                }
+            }
+            $entries += [pscustomobject]@{ model = $id; displayName = $entry.displayName.Trim(); effect = $effects }
         }
         $sharedBaseUrl = ''
         $sharedApiKey = ''
@@ -207,6 +235,14 @@ param(
 
     function New-ConfigText {
         param([string]$Original, [string]$Slug, [string]$Endpoint)
+        $desktopEfforts = @()
+        foreach ($entry in $configuredModels) {
+            foreach ($effect in $entry.effect) {
+                if ($desktopEfforts -cnotcontains $effect) { $desktopEfforts += $effect }
+            }
+        }
+        $desktopSetting = 'enabled-reasoning-efforts = ' + (ConvertTo-Json -InputObject $desktopEfforts -Compress)
+        $desktopConfigured = $false
         $settings = [ordered]@{
             model = (ConvertTo-TomlString $Slug)
             model_provider = (ConvertTo-TomlString $providerId)
@@ -239,6 +275,11 @@ param(
                     $section = @(Get-TomlPath $header.Groups['name'].Value)
                     $skipSection = $section.Count -ge 2 -and $section[0] -ceq 'model_providers' -and $section[1] -ceq $providerId
                     if (-not $skipSection) { $output.Add($line) }
+                    if ($section.Count -eq 1 -and $section[0] -ceq 'desktop') {
+                        if ($desktopConfigured -or $line.TrimStart().StartsWith('[[')) { throw '原 TOML 配置的 [desktop] 必须是唯一的普通配置段。原配置未修改。' }
+                        $output.Add($desktopSetting)
+                        $desktopConfigured = $true
+                    }
                     continue
                 }
                 $assignment = [regex]::Match($line, '^\s*(?<key>(?:"(?:\\.|[^"\\])*"|''[^'']*''|[A-Za-z0-9_.-]+|\s)+?)\s*=')
@@ -250,11 +291,20 @@ param(
                             if ($key -ceq 'model_providers') {
                                 throw 'model_providers 使用了内联表；请改为 [model_providers.<名称>] 格式后重试。原配置未修改。'
                             }
+                            if ($key -ceq 'desktop') {
+                                throw 'desktop 使用了内联表；请改为 [desktop] 格式后重试。原配置未修改。'
+                            }
                             $skipAssignment = $settings.Keys -ccontains $key -or $removeKeys -ccontains $key
                         } elseif ($keyParts[0] -ceq 'model_providers' -and $keyParts[1] -ceq $providerId) {
                             $skipAssignment = $true
+                        } elseif ($keyParts[0] -ceq 'desktop') {
+                            if ($keyParts.Count -eq 2 -and $keyParts[1] -ceq 'enabled-reasoning-efforts') { $skipAssignment = $true }
+                            else { throw 'desktop 使用了点分键；请改为 [desktop] 格式后重试。原配置未修改。' }
                         }
                     } elseif ($section.Count -eq 1 -and $section[0] -ceq 'model_providers' -and $keyParts[0] -ceq $providerId) {
+                        $skipAssignment = $true
+                    } elseif ($section.Count -eq 1 -and $section[0] -ceq 'desktop' -and
+                        $keyParts.Count -eq 1 -and $keyParts[0] -ceq 'enabled-reasoning-efforts') {
                         $skipAssignment = $true
                     }
                 }
@@ -263,6 +313,11 @@ param(
             if (-not $skipSection -and -not $skipAssignment) { $output.Add($line) }
         }
         if ($state.Multiline -or $state.Depth -ne 0) { throw '原 TOML 配置存在未闭合字符串或数组。原配置未修改。' }
+        if (-not $desktopConfigured) {
+            $output.Add('')
+            $output.Add('[desktop]')
+            $output.Add($desktopSetting)
+        }
         $output.Add('')
         $output.Add('[model_providers.' + $providerId + ']')
         $output.Add('name = "本地模型"')
@@ -278,18 +333,22 @@ param(
         $instructions = '你是 Codex 编程助手。遵守用户和工作目录中的指令，先检查现有代码，再完成用户要求的修改。使用可用工具处理文件和命令；尽量保留无关配置和用户已有修改。根据证据说明结果，不声称执行过尚未执行的操作。默认使用中文回复。'
         $entries = @()
         for ($i = 0; $i -lt $configuredModels.Count; $i++) {
+            $entry = $configuredModels[$i]
+            $supportedReasoningLevels = @(
+                foreach ($effect in $entry.effect) {
+                    @{ effort = $effect; description = $reasoningDescriptions[$effect] }
+                }
+            )
             $entries += [ordered]@{
-                slug = $configuredModels[$i].model
-                display_name = $configuredModels[$i].displayName
+                slug = $entry.model
+                display_name = $entry.displayName
                 description = '通过本地模型网关使用 Responses API'
                 visibility = 'list'
                 supported_in_api = $true
                 priority = $i + 1
-                # 与 config.toml 保持一致，使 Codex 可使用 xhigh 档位。
-                default_reasoning_level = $reasoningEffort
-                supported_reasoning_levels = @(
-                    @{ effort = $reasoningEffort; description = '超高思考等级' }
-                )
+                # 每个模型使用自身 effect 数组的顺序和最后一项默认值。
+                default_reasoning_level = $entry.effect[-1]
+                supported_reasoning_levels = $supportedReasoningLevels
                 supports_reasoning_summaries = $false
                 default_reasoning_summary = 'none'
                 support_verbosity = $false
@@ -417,7 +476,7 @@ param(
             $suffix = if ($i -eq 0) { '（默认）' } else { '' }
             # 编号 9 固定用于恢复；第九个及之后的模型从 10 开始编号。
             $menuNumber = if ($i -lt 8) { $i + 1 } else { $i + 2 }
-            Write-Host ('{0}. 使用 {1} [{2}]{3}' -f $menuNumber, $configuredModels[$i].displayName, $configuredModels[$i].model, $suffix)
+            Write-Host ('{0}. 使用 {1} [{2}]{3}，思考等级：{4}（默认 {5}）' -f $menuNumber, $configuredModels[$i].displayName, $configuredModels[$i].model, $suffix, ($configuredModels[$i].effect -join ' / '), $configuredModels[$i].effect[-1])
         }
         Write-Host '9. 恢复首次安装前的配置（包括上下文）'
         Write-Host '0. 退出'
@@ -445,6 +504,7 @@ param(
     $newCatalog = ''
     if ($selectedAction -eq 'Install') {
         if ($null -eq $selectedEntry) { $selectedEntry = Select-ConfiguredModel $Model }
+        $reasoningEffort = $selectedEntry.effect[-1]
         if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw 'ApiKey 不能为空。' }
         if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'BaseUrl 不能为空，请在 JSON 中填写 baseUrl。' }
         $endpoint = $BaseUrl.Trim().TrimEnd('/')
@@ -476,7 +536,7 @@ param(
             Set-AtomicFile $catalogPath $newCatalog
             Set-AtomicFile $configPath $newConfig
             Write-Status ('已按 JSON 同步 ' + $configuredModels.Count + ' 个模型，默认使用 ' + $selectedEntry.displayName + ' [' + $selectedEntry.model + ']')
-            Write-Status ('模型思考等级：' + $reasoningEffort)
+            Write-Status ('模型思考等级：' + $reasoningEffort + '，可选档位：' + ($selectedEntry.effect -join ' / '))
             Write-Status ('上下文：1M [' + $contextWindow + ' tokens]')
             Write-Status ('配置文件：' + $configPath)
             Write-Status ('模型目录：' + $catalogPath)

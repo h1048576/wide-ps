@@ -4,11 +4,13 @@
   "models": [
     {
       "model": "cbcn/glm-5.3-flashx",
-      "displayName": "glm-5.3-flashx"
+      "displayName": "glm-5.3-flashx",
+      "effect": ["high", "max"]
     },
     {
       "model": "cbcn/deepseek-v4.1-flash",
-      "displayName": "deepseek-v4.1-flash"
+      "displayName": "deepseek-v4.1-flash",
+      "effect": ["high", "max"]
     }
   ]
 }
